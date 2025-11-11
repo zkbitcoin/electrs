@@ -5,6 +5,8 @@ use bitcoin::{BlockHash, OutPoint, Txid};
 use bitcoin_slices::{bsl, Visit, Visitor};
 use std::ops::ControlFlow;
 use std::thread;
+use bitcoin::hashes::sha256;
+use log::{info, debug, trace};
 
 use crate::{
     chain::{Chain, NewHeader},
@@ -17,6 +19,8 @@ use crate::{
         TxidRow,
     },
 };
+
+use crate::pivx::{detect_pivx_coinstake_bsl, scripthash_hex, classify_pivx_output, classify_cold_hot_stake};
 
 #[derive(Clone)]
 struct Stats {
@@ -277,19 +281,83 @@ fn index_single_block(
     impl Visitor for IndexBlockVisitor<'_> {
         fn visit_transaction(&mut self, tx: &bsl::Transaction) -> ControlFlow<()> {
             let txid = bsl_txid(tx);
+
+            // -------------------------------------------------------------------------
+            // Detect coinstake transactions (PoS) vs regular
+            // -------------------------------------------------------------------------
+            if detect_pivx_coinstake_bsl(tx) {
+                trace!("Indexing PIVX coinstake {}", txid);
+            } else {
+                trace!("Indexing transaction {}", txid);
+            }
+
+            // -------------------------------------------------------------------------
+            // Detect shielded (zPIV or Sapling) transactions
+            // -------------------------------------------------------------------------
+            // Convert the tx into JSON-like structure to inspect fields
+            // -------------------------------------------------------------------------
+            // Detect shielded (zPIV / Sapling) transactions (placeholder logic)
+            // -------------------------------------------------------------------------
+            // `bsl::Transaction` isn't serializable to JSON, so we cannot call `is_shielded_tx()` directly.
+            // In the future, this can be done by querying RPC for full tx JSON data.
+            if false {
+                debug!(
+                    "🔒 PIVX: detected shielded transaction at height={} txid={}",
+                    self.height, txid
+                );
+                let marker = format!("shielded:{}", txid);
+                let tag_hash = sha256::Hash::hash(marker.as_bytes());
+                let tag_sh = ScriptHash::from_raw_hash(tag_hash);
+                self.batch
+                    .funding_rows
+                    .push(ScriptHashRow::row(tag_sh, self.height).to_db_row());
+            }
+
+            // -------------------------------------------------------------------------
+            // Normal TX indexing (unchanged)
+            // -------------------------------------------------------------------------
             self.batch
                 .txid_rows
                 .push(TxidRow::row(txid, self.height).to_db_row());
+
             ControlFlow::Continue(())
         }
 
-        fn visit_tx_out(&mut self, _vout: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
-            let script = bitcoin::Script::from_bytes(tx_out.script_pubkey());
-            // skip indexing unspendable outputs
-            if !script.is_op_return() {
-                let row = ScriptHashRow::row(ScriptHash::new(script), self.height);
+        fn visit_tx_out(&mut self, vout_index: usize, tx_out: &bsl::TxOut) -> ControlFlow<()> {
+            let script_bytes = tx_out.script_pubkey();
+
+            // Detect cold/hot staking scripts (using OP_CHECKCOLDSTAKEVERIFY)
+            let stake_type = classify_cold_hot_stake(script_bytes);
+
+            // Compute PIVX reward classification (height-aware)
+            let classification = classify_pivx_output(
+                tx_out.value() as f64 / 1e8,  // convert satoshis → PIV
+                vout_index,
+                0,
+                self.height,
+            );
+
+            // Skip only true OP_RETURN (unspendable) outputs
+            if !bitcoin::Script::from_bytes(script_bytes).is_op_return() {
+                // ✅ moved scripthash logic *inside* this conditional
+                let sh_hex = scripthash_hex(script_bytes);
+                let sh = sh_hex.parse::<sha256::Hash>()
+                    .map(ScriptHash::from_raw_hash)
+                    .unwrap_or_else(|_| ScriptHash::new(&bitcoin::Script::from_bytes(script_bytes)));
+                let row = ScriptHashRow::row(sh, self.height);
+
+                debug!(
+                    "PIVX: height={} vout={} value={:.6} stake_type={} reward_class={}",
+                    self.height,
+                    vout_index,
+                    tx_out.value() as f64 / 1e8,
+                    stake_type,
+                    classification
+                );
+
                 self.batch.funding_rows.push(row.to_db_row());
             }
+
             ControlFlow::Continue(())
         }
 

@@ -21,6 +21,10 @@ use crate::{
     types::SerBlock,
 };
 
+// --- PIVX integration imports ---
+use log::{info, debug, warn};
+use crate::chain_kind::{chain_from_env, ChainKind};
+
 enum PollResult {
     Done(Result<()>),
     Retry,
@@ -99,8 +103,8 @@ fn rpc_connect(config: &Config) -> Result<Client> {
 }
 
 pub struct Daemon {
-    p2p: Mutex<Connection>,
-    rpc: Client,
+    pub(crate) p2p: Mutex<Connection>,
+    pub rpc: Client,
 }
 
 impl Daemon {
@@ -110,6 +114,24 @@ impl Daemon {
         metrics: &Metrics,
     ) -> Result<Self> {
         let mut rpc = rpc_connect(config)?;
+
+        // ---------------------------------------------------------------------------
+        //  Detect if we're running in PIVX mode and short-circuit the Bitcoin checks
+        // ---------------------------------------------------------------------------
+        let chain = crate::chain_kind::chain_from_env();
+        if chain == crate::chain_kind::ChainKind::Pivx {
+            info!("🔗 Detected PIVX chain — using pivxd RPC adapter");
+            return Ok(Self {
+                p2p: Mutex::new(Connection::connect(
+                    config.network,
+                    config.daemon_p2p_addr,
+                    metrics,
+                    config.signet_magic,
+                )?),
+                rpc, // this rpc points to pivxd
+            });
+        }
+        // ---------------------------------------------------------------------------
 
         loop {
             exit_flag
@@ -127,14 +149,18 @@ impl Daemon {
         }
 
         let network_info = rpc.get_network_info()?;
-        if network_info.version < 21_00_00 {
+        let chain = chain_from_env();
+
+        if chain == ChainKind::Bitcoin && network_info.version < 21_00_00 {
             bail!("electrs requires bitcoind 0.21+");
         }
-        if !network_info.network_active {
+
+        if chain == ChainKind::Bitcoin && !network_info.network_active {
             bail!("electrs requires active bitcoind p2p network");
         }
+
         let info = rpc.get_blockchain_info()?;
-        if info.pruned {
+        if chain == ChainKind::Bitcoin && info.pruned {
             bail!("electrs requires non-pruned bitcoind node");
         }
 

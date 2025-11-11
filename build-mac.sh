@@ -8,5 +8,5 @@ export LIBRARY_PATH="/opt/homebrew/lib"
 
 export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
 
-cargo clean
+#cargo clean
 cargo build --release

@@ -24,5 +24,8 @@ mod status;
 mod thread;
 mod tracker;
 mod types;
+pub mod pivx;
+pub mod chain_kind;
+pub mod daemon_pivx;
 
 pub use server::run;

@@ -31,6 +31,7 @@ use crate::{
     metrics::{default_duration_buckets, default_size_buckets, Histogram, Metrics},
 };
 
+#[derive(Debug)]
 enum Request {
     GetNewHeaders(GetHeadersMessage),
     GetBlocks(Vec<Inventory>),
@@ -141,6 +142,62 @@ impl Connection {
         metrics: &Metrics,
         magic: Magic,
     ) -> Result<Self> {
+
+        // ================================================================
+        // PIVX: disable Bitcoin P2P handshake (use RPC-only mode)
+        // ================================================================
+        let is_pivx = std::env::var("ELECTRS_CHAIN")
+            .map(|v| v.to_lowercase() == "pivx")
+            .unwrap_or(false);
+
+        if is_pivx {
+            warn!("PIVX mode: skipping Bitcoin P2P connection — unsupported protocol");
+
+            let (req_send, req_recv) = bounded::<Request>(1);
+            let (blocks_send, blocks_recv) = bounded::<SerBlock>(10);
+            let (headers_send, headers_recv) = bounded::<Vec<BlockHeader>>(1);
+            let (new_block_send, new_block_recv) = bounded::<()>(0);
+
+            // spawn dummy threads to keep channels open
+            crate::thread::spawn("p2p_stub_loop", move || loop {
+                use crossbeam_channel::select;
+                select! {
+                    recv(req_recv) -> msg => {
+                        if let Ok(req) = msg {
+                            debug!("PIVX RPC-only stub got request: {:?}", req);
+                            // Optionally, respond with empty headers
+                            match req {
+                                Request::GetNewHeaders(_) => {
+                                    let _ = headers_send.send(vec![]);
+                                }
+                                Request::GetBlocks(_) => {
+                                    let _ = blocks_send.send(Vec::new());
+                                }
+                            }
+                        } else {
+                            break Ok(()); // channel closed
+                        }
+                    }
+                    default(Duration::from_secs(60)) => {}, // keep alive
+                }
+            });
+
+            let blocks_duration = metrics.histogram_vec(
+                "p2p_blocks_duration",
+                "Time spent getting blocks via p2p protocol (in seconds)",
+                "step",
+                default_duration_buckets(),
+            );
+
+            return Ok(Connection {
+                req_send,
+                blocks_recv,
+                headers_recv,
+                new_block_recv,
+                blocks_duration,
+            });
+        }
+
         let recv_conn = TcpStream::connect(address)
             .with_context(|| format!("{} p2p failed to connect: {:?}", network, address))?;
         let mut send_conn = recv_conn

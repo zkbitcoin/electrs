@@ -116,11 +116,15 @@ impl Daemon {
         let mut rpc = rpc_connect(config)?;
 
         // ---------------------------------------------------------------------------
-        //  Detect if we're running in PIVX mode and short-circuit the Bitcoin checks
+        // Detect if we're running in PIVX mode and short-circuit Bitcoin P2P logic
         // ---------------------------------------------------------------------------
         let chain = crate::chain_kind::chain_from_env();
         if chain == crate::chain_kind::ChainKind::Pivx {
             info!("🔗 Detected PIVX chain — using pivxd RPC adapter");
+
+            // Add explicit RPC-only mode message
+            info!("PIVX RPC-only mode active — syncing via pivxd getblock RPC (no P2P threads)");
+
             return Ok(Self {
                 p2p: Mutex::new(Connection::connect(
                     config.network,
@@ -128,9 +132,10 @@ impl Daemon {
                     metrics,
                     config.signet_magic,
                 )?),
-                rpc, // this rpc points to pivxd
+                rpc, // pivxd RPC client
             });
         }
+
         // ---------------------------------------------------------------------------
 
         loop {

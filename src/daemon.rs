@@ -171,7 +171,38 @@ impl Daemon {
             bail!("electrs requires active bitcoind p2p network");
         }
 
-        let info = rpc.get_blockchain_info()?;
+        // ---------------------------------------------------------------------------
+        // Blockchain info (PIVX-compatible schema)
+        // ---------------------------------------------------------------------------
+        use serde_json::Value;
+        use bitcoincore_rpc::json::GetBlockchainInfoResult;
+
+        let info = if chain == ChainKind::Pivx {
+            let mut raw: Value = rpc.call("getblockchaininfo", &[])?;
+            if let Some(softforks_val) = raw.get_mut("softforks") {
+                if softforks_val.is_array() {
+                    // convert [ { id, ... }, ... ] → { "id": { ... }, ... }
+                    let arr = softforks_val.take();
+                    let mut new_obj = serde_json::Map::new();
+                    if let Some(array) = arr.as_array() {
+                        for sf in array {
+                            if let Some(id) = sf.get("id").and_then(|v| v.as_str()) {
+                                new_obj.insert(id.to_string(), sf.clone());
+                            }
+                        }
+                    }
+                    *softforks_val = Value::Object(new_obj);
+                    info!("PIVX: patched getblockchaininfo.softforks from array → map");
+                }
+            }
+
+            serde_json::from_value::<GetBlockchainInfoResult>(raw)
+                .context("failed to parse PIVX getblockchaininfo after schema patch")?
+        } else {
+            rpc.get_blockchain_info()?
+        };
+
+        // For Bitcoin nodes, ensure they aren't pruned
         if chain == ChainKind::Bitcoin && info.pruned {
             bail!("electrs requires non-pruned bitcoind node");
         }

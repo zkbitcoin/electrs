@@ -313,22 +313,44 @@ impl Config {
         }
 
         let daemon_dir = &config.daemon_dir;
-        let daemon_auth = SensitiveAuth(match (config.auth, config.cookie_file) {
+
+        // ----------------------------------------------------------------------------
+        // Enhanced auth parsing (PIVX compatible):
+        //  • supports CookieFile() default
+        //  • supports daemon_auth="UserPass(user,pass)" in TOML
+        //  • supports daemon_auth="user:pass" shorthand
+        // ----------------------------------------------------------------------------
+        let daemon_auth = SensitiveAuth(match (config.auth.clone(), config.cookie_file.clone()) {
             (None, None) => Auth::CookieFile(daemon_dir.join(".cookie")),
             (None, Some(cookie_file)) => Auth::CookieFile(cookie_file),
-            (Some(auth), None) => {
-                let parts: Vec<&str> = auth.splitn(2, ':').collect();
+            (Some(auth_str), None) => {
+                // Normalize and strip optional wrappers like UserPass()
+                let clean = auth_str
+                    .trim()
+                    .trim_start_matches("UserPass(")
+                    .trim_end_matches(')')
+                    .replace('"', "")
+                    .replace('\'', "");
+
+                // Split by either ':' or ',' to allow flexible formatting
+                let parts: Vec<&str> = clean
+                    .split(|c| c == ':' || c == ',')
+                    .map(|s| s.trim())
+                    .collect();
+
                 if parts.len() != 2 {
-                    eprintln!("Error: auth cookie doesn't contain colon");
+                    eprintln!("Error: invalid daemon_auth format — expected UserPass(user,pass) or user:pass");
                     std::process::exit(1);
                 }
-                Auth::UserPass(parts[0].to_owned(), parts[1].to_owned())
+
+                Auth::UserPass(parts[0].to_string(), parts[1].to_string())
             }
             (Some(_), Some(_)) => {
-                eprintln!("Error: ambiguous configuration - auth and cookie_file can't be specified at the same time");
+                eprintln!("Error: ambiguous configuration — cannot set both auth and cookie_file");
                 std::process::exit(1);
             }
         });
+
 
         let log_filters = config.log_filters;
 

@@ -251,10 +251,103 @@ impl Daemon {
     }
 
     pub(crate) fn get_mempool_info(&self) -> Result<json::GetMempoolInfoResult> {
+        // --- Detect if we're running in PIVX mode ---
+        let is_pivx = std::env::var("ELECTRS_CHAIN")
+            .map(|v| v.to_lowercase() == "pivx")
+            .unwrap_or(false);
+
+        if is_pivx {
+            use bitcoin::Amount;
+            use bitcoincore_rpc::jsonrpc;
+            use serde_json::value::RawValue;
+
+            // Fetch mempool txids
+            let txids: Vec<String> = self
+                .rpc
+                .call("getrawmempool", &[json!(false)])
+                .context("failed to get raw mempool")?;
+
+            let size = txids.len();
+            let bytes = size * 250;
+            let usage = bytes;
+            let max_mempool = 300_000_000usize;
+            let mempool_min_fee = Amount::from_sat(1000);
+            let min_relay_tx_fee = Amount::from_sat(1000);
+            let incremental_relay_fee = Some(Amount::from_sat(1000));
+
+            // --- Compute total_fee via batch getmempoolentry ---
+            let mut total_fee_sat: u64 = 0;
+            if !txids.is_empty() {
+                let client = self.rpc.get_jsonrpc_client();
+
+                // Build list of RawValue arguments
+                let args: Vec<Box<RawValue>> = txids
+                    .iter()
+                    .map(|txid| {
+                        jsonrpc::try_arg([txid])
+                            .context("failed to serialize txid into JSON")
+                            .unwrap()
+                    })
+                    .collect();
+
+                let reqs: Vec<jsonrpc::Request> = args
+                    .iter()
+                    .map(|arg| client.build_request("getmempoolentry", Some(arg)))
+                    .collect();
+
+                match client.send_batch(&reqs) {
+                    Ok(results) => {
+                        for resp_opt in results {
+                            if let Some(resp) = resp_opt {
+                                // Each Response -> attempt to parse as serde_json::Value
+                                if let Ok(entry) = resp.result::<serde_json::Value>() {
+                                    if let Some(fee_val) = entry
+                                        .get("fee")
+                                        .and_then(|f: &serde_json::Value| f.as_f64())
+                                    {
+                                        total_fee_sat =
+                                            total_fee_sat.saturating_add((fee_val * 1e8) as u64);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("PIVX: batch getmempoolentry failed: {}", e);
+                    }
+                }
+            }
+
+            let pivx_info = json::GetMempoolInfoResult {
+                size,
+                bytes,
+                usage,
+                max_mempool,
+                mempool_min_fee,
+                min_relay_tx_fee,
+                incremental_relay_fee,
+                full_rbf: Some(false),
+                loaded: Some(true),
+                unbroadcast_count: Some(0),
+                total_fee: Some(Amount::from_sat(total_fee_sat)),
+            };
+
+            log::info!(
+                "PIVX mempool info synthesized: {} txs (~{} bytes, total_fee={} PIV)",
+                size,
+                bytes,
+                total_fee_sat as f64 / 1e8
+            );
+
+            return Ok(pivx_info);
+        }
+
+        // --- Default Bitcoin path ---
         self.rpc
             .get_mempool_info()
             .context("failed to get mempool info")
     }
+
 
     pub(crate) fn get_mempool_txids(&self) -> Result<Vec<Txid>> {
         self.rpc

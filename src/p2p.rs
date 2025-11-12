@@ -223,7 +223,7 @@ impl Connection {
             let (req_send, req_recv) = bounded::<Request>(1);
             let (blocks_send, blocks_recv) = bounded::<SerBlock>(10);
             let (headers_send, headers_recv) = bounded::<Vec<BlockHeader>>(1);
-            let (new_block_send, new_block_recv) = bounded::<()>(0);
+            let (_new_block_send, new_block_recv) = bounded::<()>(0);
 
             // spawn dummy threads to keep channels open
             crate::thread::spawn("p2p_stub_loop", move || loop {

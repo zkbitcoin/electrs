@@ -12,9 +12,30 @@ pub(crate) struct NewHeader {
 
 impl NewHeader {
     pub(crate) fn from((header, height): (BlockHeader, usize)) -> Self {
+        use crate::chain_kind::{chain_from_env, ChainKind};
+
+        let chain_kind = chain_from_env();
+
+        let hash = if chain_kind == ChainKind::Pivx {
+            use bitcoin::hashes::{sha256d, Hash};
+            let zero_hash = sha256d::Hash::from_slice(&[0u8; 32])
+                .expect("zero hash from slice must succeed");
+            bitcoin::BlockHash::from_raw_hash(zero_hash)
+        } else {
+            header.block_hash()
+        };
+
+        Self { header, hash, height }
+    }
+
+    pub(crate) fn with_canonical_hash(
+        header: BlockHeader,
+        height: usize,
+        canonical_hash: bitcoin::BlockHash,
+    ) -> Self {
         Self {
             header,
-            hash: header.block_hash(),
+            hash: canonical_hash,
             height,
         }
     }
@@ -100,7 +121,18 @@ impl Chain {
             }
             for (h, height) in headers.into_iter().zip(first_height..) {
                 assert_eq!(h.height, height);
-                assert_eq!(h.hash, h.header.block_hash());
+
+                // --- Skip hash consistency check for PIVX ---
+                let chain_kind = crate::chain_kind::chain_from_env();
+                if chain_kind != crate::chain_kind::ChainKind::Pivx {
+                    assert_eq!(h.hash, h.header.block_hash());
+                } else {
+                    log::debug!(
+                        "🔧 Skipping header hash assert at height {} (PIVX uses X11/Quark hash)",
+                        h.height
+                    );
+                }
+
                 assert!(self.heights.insert(h.hash, h.height).is_none());
                 self.headers.push((h.hash, h.header));
             }

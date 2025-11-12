@@ -8,9 +8,11 @@ _*/
 .env
 *.dat
 electrs.toml
+electrs_pivx.toml
 data/
 tests/bitcoin-*
 tests/bin
 .idea/
 *.txt
 *.json
+electrs_db_pivx

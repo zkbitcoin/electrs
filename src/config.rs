@@ -237,17 +237,26 @@ impl Config {
             Network::Signet => 34224,
         };
 
+        // ----------------------------------------------------------------------------
+        // PIVX: allow custom signet_magic when ELECTRS_CHAIN=pivx
+        // ----------------------------------------------------------------------------
+        let is_pivx = std::env::var("ELECTRS_CHAIN")
+            .map(|v| v.to_lowercase() == "pivx")
+            .unwrap_or(false);
+
         let magic = match (config.network, config.signet_magic) {
-            (Network::Signet, Some(magic)) => magic.parse().unwrap_or_else(|error| {
-                eprintln!(
-                    "Error: signet magic '{}' is not a valid hex string: {}",
-                    magic, error
-                );
-                std::process::exit(1);
-            }),
+            (Network::Signet, Some(magic)) | (Network::Bitcoin, Some(magic)) if is_pivx => {
+                magic.parse().unwrap_or_else(|error| {
+                    eprintln!(
+                        "Error: magic '{}' is not a valid hex string: {}",
+                        magic, error
+                    );
+                    std::process::exit(1);
+                })
+            }
             (network, None) => network.magic(),
             (_, Some(_)) => {
-                eprintln!("Error: signet magic only available on signet");
+                eprintln!("Error: signet magic only available on signet (or ELECTRS_CHAIN=pivx)");
                 std::process::exit(1);
             }
         };

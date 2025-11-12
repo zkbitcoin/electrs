@@ -123,6 +123,7 @@ impl From<BitcoinNetwork> for Network {
 
 /// Parsed and post-processed configuration
 #[derive(Debug)]
+#[derive(Clone)]
 pub struct Config {
     // See below for the documentation of each field:
     pub network: Network,
@@ -148,6 +149,7 @@ pub struct Config {
     pub signet_magic: Magic,
 }
 
+#[derive(Clone)]
 pub struct SensitiveAuth(pub Auth);
 
 impl SensitiveAuth {

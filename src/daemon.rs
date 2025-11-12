@@ -102,6 +102,12 @@ fn rpc_connect(config: &Config) -> Result<Client> {
     )))
 }
 
+pub fn pivx_rpc_from_config(cfg: &Config) -> bitcoincore_rpc::Client {
+    let auth = cfg.daemon_auth.get_auth();
+    let rpc_url = format!("http://{}", cfg.daemon_rpc_addr);
+    Client::new(&rpc_url, auth).expect("PIVX: failed to connect to pivxd RPC")
+}
+
 pub struct Daemon {
     pub(crate) p2p: Mutex<Connection>,
     pub rpc: Client,
@@ -131,6 +137,7 @@ impl Daemon {
                     config.daemon_p2p_addr,
                     metrics,
                     config.signet_magic,
+                    &config,
                 )?),
                 rpc, // pivxd RPC client
             });
@@ -174,7 +181,9 @@ impl Daemon {
             config.daemon_p2p_addr,
             metrics,
             config.signet_magic,
+            &config,
         )?);
+
         Ok(Self { p2p, rpc })
     }
 

@@ -62,74 +62,140 @@ pub(crate) struct Connection {
     new_block_recv: Receiver<()>,
 
     blocks_duration: Histogram,
+
+    config: std::sync::Arc<crate::config::Config>,
 }
 
 impl Connection {
     /// Get new block headers (supporting reorgs).
     /// https://en.bitcoin.it/wiki/Protocol_documentation#getheaders
     /// Defined as `&mut self` to prevent concurrent invocations (https://github.com/romanz/electrs/pull/526#issuecomment-934685515).
-    pub(crate) fn get_new_headers(&mut self, chain: &Chain) -> Result<Vec<NewHeader>> {
-        self.req_send.send(Request::get_new_headers(chain))?;
-        let headers = self
-            .headers_recv
-            .recv()
-            .context("failed to get new headers")?;
+        pub(crate) fn get_new_headers(&mut self, chain: &Chain) -> Result<Vec<NewHeader>> {
+            // ----------------------------------------------------------
+            // PIVX RPC-only branch (ELECTRS_CHAIN=pivx)
+            // ----------------------------------------------------------
+            let is_pivx = std::env::var("ELECTRS_CHAIN")
+                .map(|v| v.to_lowercase() == "pivx")
+                .unwrap_or(false);
 
-        debug!("got {} new headers", headers.len());
-        let prev_blockhash = match headers.first() {
-            None => return Ok(vec![]),
-            Some(first) => first.prev_blockhash,
-        };
-        let new_heights = match chain.get_block_height(&prev_blockhash) {
-            Some(last_height) => (last_height + 1)..,
-            None => bail!("missing prev_blockhash: {}", prev_blockhash),
-        };
-        Ok(headers
-            .into_iter()
-            .zip(new_heights)
-            .map(NewHeader::from)
-            .collect())
-    }
+            if is_pivx {
+                use bitcoincore_rpc::RpcApi;
+                use serde_json::json;
+
+                debug!("PIVX RPC-only header sync active");
+                let rpc = crate::daemon::pivx_rpc_from_config(&self.config);
+
+                // 1) Ask pivxd what the best header is
+                let info = rpc.get_blockchain_info()?;
+                let best = info.best_block_hash;
+
+                // 2) Fetch raw header hex
+                let header_hex: String = rpc.call("getblockheader", &[json!(best), json!(false)])?;
+                let header_bytes = hex::decode(header_hex)
+                    .map_err(|e| anyhow::anyhow!("decode getblockheader hex: {e}"))?;
+                let header: BlockHeader = bitcoin::consensus::deserialize(&header_bytes)
+                    .map_err(|e| anyhow::anyhow!("deserialize header: {e}"))?;
+
+                let height = info.blocks as usize;
+                debug!("PIVX header {} height={}", best, height);
+
+                return Ok(vec![NewHeader::from((header, height))]);
+            }
+
+            // ----------------------------------------------------------
+            // Original Bitcoin / testnet / signet path
+            // ----------------------------------------------------------
+            self.req_send.send(Request::get_new_headers(chain))?;
+            let headers = self
+                .headers_recv
+                .recv()
+                .context("failed to get new headers")?;
+
+            debug!("got {} new headers", headers.len());
+            let prev_blockhash = match headers.first() {
+                None => return Ok(vec![]),
+                Some(first) => first.prev_blockhash,
+            };
+            let new_heights = match chain.get_block_height(&prev_blockhash) {
+                Some(last_height) => (last_height + 1)..,
+                None => bail!("missing prev_blockhash: {}", prev_blockhash),
+            };
+            Ok(headers
+                .into_iter()
+                .zip(new_heights)
+                .map(NewHeader::from)
+                .collect())
+        }
+
 
     /// Request and process the specified blocks (in the specified order).
     /// See https://en.bitcoin.it/wiki/Protocol_documentation#getblocks for details.
     /// Defined as `&mut self` to prevent concurrent invocations (https://github.com/romanz/electrs/pull/526#issuecomment-934685515).
-    pub(crate) fn for_blocks<B, F>(&mut self, blockhashes: B, mut func: F) -> Result<()>
-    where
-        B: IntoIterator<Item = BlockHash>,
-        F: FnMut(BlockHash, SerBlock),
-    {
-        self.blocks_duration.observe_duration("total", || {
-            let blockhashes: Vec<BlockHash> = blockhashes.into_iter().collect();
-            if blockhashes.is_empty() {
+        pub(crate) fn for_blocks<B, F>(&mut self, blockhashes: B, mut func: F) -> Result<()>
+        where
+            B: IntoIterator<Item = BlockHash>,
+            F: FnMut(BlockHash, SerBlock),
+        {
+            // ----------------------------------------------------------
+            // PIVX RPC-only branch (ELECTRS_CHAIN=pivx)
+            // ----------------------------------------------------------
+            let is_pivx = std::env::var("ELECTRS_CHAIN")
+                .map(|v| v.to_lowercase() == "pivx")
+                .unwrap_or(false);
+
+            if is_pivx {
+                use bitcoincore_rpc::RpcApi;
+                use serde_json::json;
+
+                debug!("PIVX RPC-only block fetch active");
+                let rpc = crate::daemon::pivx_rpc_from_config(&self.config);
+
+                let blockhashes: Vec<BlockHash> = blockhashes.into_iter().collect();
+                for hash in blockhashes {
+                    let hex_block: String = rpc.call("getblock", &[json!(hash), json!(0)])?;
+                    let bytes = hex::decode(hex_block)
+                        .map_err(|e| anyhow::anyhow!("decode getblock hex: {e}"))?;
+                    func(hash, bytes);
+                    debug!("PIVX delivered block {}", hash);
+                }
                 return Ok(());
             }
-            self.blocks_duration.observe_duration("request", || {
-                debug!("loading {} blocks", blockhashes.len());
-                self.req_send.send(Request::get_blocks(&blockhashes))
-            })?;
 
-            for hash in blockhashes {
-                let block = self.blocks_duration.observe_duration("response", || {
-                    let block = self
-                        .blocks_recv
-                        .recv()
-                        .with_context(|| format!("failed to get block {}", hash))?;
-                    let header = bsl::BlockHeader::parse(&block[..])
-                        .expect("core returned invalid blockheader")
-                        .parsed_owned();
-                    ensure!(
-                        &header.block_hash_sha2()[..] == hash.as_byte_array(),
-                        "got unexpected block"
-                    );
-                    Ok(block)
+            // ----------------------------------------------------------
+            // Original Bitcoin / testnet / signet path
+            // ----------------------------------------------------------
+            self.blocks_duration.observe_duration("total", || {
+                let blockhashes: Vec<BlockHash> = blockhashes.into_iter().collect();
+                if blockhashes.is_empty() {
+                    return Ok(());
+                }
+                self.blocks_duration.observe_duration("request", || {
+                    debug!("loading {} blocks", blockhashes.len());
+                    self.req_send.send(Request::get_blocks(&blockhashes))
                 })?;
-                self.blocks_duration
-                    .observe_duration("process", || func(hash, block));
-            }
-            Ok(())
-        })
-    }
+
+                for hash in blockhashes {
+                    let block = self.blocks_duration.observe_duration("response", || {
+                        let block = self
+                            .blocks_recv
+                            .recv()
+                            .with_context(|| format!("failed to get block {}", hash))?;
+                        let header = bsl::BlockHeader::parse(&block[..])
+                            .expect("core returned invalid blockheader")
+                            .parsed_owned();
+                        ensure!(
+                            &header.block_hash_sha2()[..] == hash.as_byte_array(),
+                            "got unexpected block"
+                        );
+                        Ok(block)
+                    })?;
+                    self.blocks_duration
+                        .observe_duration("process", || func(hash, block));
+                }
+                Ok(())
+            })
+        }
+
 
     /// Note: only a single receiver will get the notification (https://github.com/romanz/electrs/pull/526#issuecomment-934687415).
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
@@ -141,6 +207,7 @@ impl Connection {
         address: SocketAddr,
         metrics: &Metrics,
         magic: Magic,
+        config: &crate::config::Config,
     ) -> Result<Self> {
 
         // ================================================================
@@ -195,6 +262,7 @@ impl Connection {
                 headers_recv,
                 new_block_recv,
                 blocks_duration,
+                config: std::sync::Arc::new(config.clone()),
             });
         }
 
@@ -373,6 +441,7 @@ impl Connection {
             headers_recv,
             new_block_recv,
             blocks_duration,
+            config: std::sync::Arc::new(config.clone()),
         })
     }
 }

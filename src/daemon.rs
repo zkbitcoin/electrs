@@ -139,7 +139,7 @@ impl Daemon {
         }
 
         let p2p = Mutex::new(Connection::connect(
-            config.network,
+            config.btc_network,
             config.daemon_p2p_addr,
             metrics,
             config.signet_magic,

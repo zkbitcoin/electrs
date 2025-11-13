@@ -38,7 +38,7 @@ impl Tracker {
             config.auto_reindex,
             config.db_parallelism,
         )?;
-        let chain = Chain::new(config.network);
+        let chain = Chain::new(config.btc_network);
         Ok(Self {
             index: Index::load(
                 store,

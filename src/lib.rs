@@ -24,5 +24,6 @@ mod status;
 mod thread;
 mod tracker;
 mod types;
+mod pivx;
 
 pub use server::run;

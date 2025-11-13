@@ -244,35 +244,51 @@ impl Config {
             }
         };
 
-        // --------------------------------------------------------------
-        // Magic Bytes
-        // --------------------------------------------------------------
-        let magic = if is_pivx {
-            // PIVX MUST provide magic in config
-            config
+        use hex::FromHex;
+        use bitcoin::p2p::Magic;
+
+        let magic: Magic = if is_pivx {
+            // --------------------------------------------------------------
+            // PIVX: magic is provided in config as raw hex (BE)
+            // --------------------------------------------------------------
+            let hex_str = config
                 .signet_magic
                 .as_ref()
-                .expect("PIVX mode requires 'signet_magic' in config")
-                .parse()
+                .expect("PIVX mode requires 'signet_magic' in config");
+
+            let bytes: [u8; 4] = <[u8; 4]>::from_hex(hex_str)
                 .unwrap_or_else(|e| {
-                    eprintln!("Invalid PIVX magic: {}", e);
+                    eprintln!("Invalid PIVX signet_magic hex: {}", e);
                     std::process::exit(1);
-                })
+                });
+
+            // PIVX wants magic in BIG-ENDIAN order *on the wire*
+            Magic::from_bytes(bytes)
+
         } else {
             match (btc_network, &config.signet_magic) {
                 (Network::Signet, Some(hex)) => {
-                    hex.parse().unwrap_or_else(|e| {
-                        eprintln!("Invalid signet magic: {}", e);
-                        std::process::exit(1)
-                    })
+                    let bytes: [u8; 4] = <[u8; 4]>::from_hex(hex)
+                        .unwrap_or_else(|e| {
+                            eprintln!("Invalid signet magic: {}", e);
+                            std::process::exit(1)
+                        });
+
+                    Magic::from_bytes(bytes)
                 }
+
+                // ----------------------------------------------------------
+                // ✔ Bitcoin: just use the network’s default magic
+                // ----------------------------------------------------------
                 (net, None) => net.magic(),
+
                 (_, Some(_)) => {
                     eprintln!("signet_magic only allowed for signet (or pivx)");
                     std::process::exit(1);
                 }
             }
         };
+
 
         // --------------------------------------------------------------
         // Address resolution

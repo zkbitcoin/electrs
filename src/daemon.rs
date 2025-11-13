@@ -5,7 +5,7 @@ use bitcoin::{Amount, BlockHash, Transaction, Txid};
 use bitcoincore_rpc::{json, jsonrpc, Auth, Client, RpcApi};
 use crossbeam_channel::Receiver;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use serde_json::{json, value::RawValue, Value};
 
 use std::fs::File;
@@ -26,36 +26,128 @@ enum PollResult {
     Retry,
 }
 
-fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
-    match client.get_blockchain_info() {
-        Ok(info) => {
-            if skip_block_download_wait {
-                // bitcoind RPC is available, don't wait for block download to finish
-                return PollResult::Done(Ok(()));
-            }
-            let left_blocks = info.headers - info.blocks;
-            if info.initial_block_download || left_blocks > 0 {
-                info!(
-                    "waiting for {} blocks to download{}",
-                    left_blocks,
-                    if info.initial_block_download {
-                        " (IBD)"
-                    } else {
-                        ""
+/// Minimal PIVX-aware blockchain info, compatible with both Bitcoin and PIVX.
+#[allow(dead_code)]
+#[derive(Deserialize)]
+struct PivxBlockchainInfo {
+    chain: String,
+    blocks: u64,
+    headers: u64,
+
+    // Bitcoin Core field name:
+    #[serde(default)]
+    initialblockdownload: Option<bool>,
+
+    // PIVX field name:
+    #[serde(default)]
+    initial_block_downloading: Option<bool>,
+
+    // Not all fields are needed; we only care about pruned on Bitcoin (and only in BTC mode).
+    #[serde(default)]
+    pruned: Option<bool>,
+}
+
+impl PivxBlockchainInfo {
+    fn is_initial_block_download(&self) -> bool {
+        self.initialblockdownload
+            .or(self.initial_block_downloading)
+            .unwrap_or(false)
+    }
+
+    fn left_blocks(&self) -> u64 {
+        self.headers.saturating_sub(self.blocks)
+    }
+}
+
+enum PollMode {
+    Bitcoin,
+    Pivx,
+}
+
+fn rpc_poll(
+    client: &mut Client,
+    skip_block_download_wait: bool,
+    mode: &PollMode,
+) -> PollResult {
+    match mode {
+        PollMode::Bitcoin => {
+            // Original Bitcoin path (unchanged)
+            match client.get_blockchain_info() {
+                Ok(info) => {
+                    if skip_block_download_wait {
+                        // bitcoind RPC is available, don't wait for block download to finish
+                        return PollResult::Done(Ok(()));
                     }
-                );
-                return PollResult::Retry;
-            }
-            PollResult::Done(Ok(()))
-        }
-        Err(err) => {
-            if let Some(e) = extract_bitcoind_error(&err) {
-                if e.code == -28 {
-                    debug!("waiting for RPC warmup: {}", e.message);
-                    return PollResult::Retry;
+                    let left_blocks = info.headers - info.blocks;
+                    if info.initial_block_download || left_blocks > 0 {
+                        info!(
+                            "waiting for {} blocks to download{}",
+                            left_blocks,
+                            if info.initial_block_download {
+                                " (IBD)"
+                            } else {
+                                ""
+                            }
+                        );
+                        return PollResult::Retry;
+                    }
+                    PollResult::Done(Ok(()))
+                }
+                Err(err) => {
+                    if let Some(e) = extract_bitcoind_error(&err) {
+                        if e.code == -28 {
+                            debug!("waiting for RPC warmup: {}", e.message);
+                            return PollResult::Retry;
+                        }
+                    }
+                    PollResult::Done(Err(err).context("daemon not available"))
                 }
             }
-            PollResult::Done(Err(err).context("daemon not available"))
+        }
+        PollMode::Pivx => {
+            // PIVX: getblockchaininfo has slightly different schema
+            match client.call("getblockchaininfo", &[]) {
+                Ok(raw) => {
+                    let info: PivxBlockchainInfo = match serde_json::from_value(raw) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            return PollResult::Done(
+                                Err(e).context("failed to parse PIVX blockchain info"),
+                            );
+                        }
+                    };
+
+                    if skip_block_download_wait {
+                        // RPC is available, don't wait for full IBD
+                        return PollResult::Done(Ok(()));
+                    }
+
+                    let left_blocks = info.left_blocks();
+                    if info.is_initial_block_download() || left_blocks > 0 {
+                        info!(
+                            "waiting for {} blocks to download{}",
+                            left_blocks,
+                            if info.is_initial_block_download() {
+                                " (IBD)"
+                            } else {
+                                ""
+                            }
+                        );
+                        return PollResult::Retry;
+                    }
+
+                    PollResult::Done(Ok(()))
+                }
+                Err(err) => {
+                    if let Some(e) = extract_bitcoind_error(&err) {
+                        if e.code == -28 {
+                            debug!("waiting for RPC warmup: {}", e.message);
+                            return PollResult::Retry;
+                        }
+                    }
+                    PollResult::Done(Err(err).context("daemon not available"))
+                }
+            }
         }
     }
 }
@@ -111,11 +203,19 @@ impl Daemon {
     ) -> Result<Self> {
         let mut rpc = rpc_connect(config)?;
 
+        // Decide mode based on raw network string
+        let is_pivx = config.network == "pivx";
+        let poll_mode = if is_pivx {
+            PollMode::Pivx
+        } else {
+            PollMode::Bitcoin
+        };
+
         loop {
             exit_flag
                 .poll()
                 .context("bitcoin RPC polling interrupted")?;
-            match rpc_poll(&mut rpc, config.skip_block_download_wait) {
+            match rpc_poll(&mut rpc, config.skip_block_download_wait, &poll_mode) {
                 PollResult::Done(result) => {
                     result.context("bitcoind RPC polling failed")?;
                     break; // on success, finish polling
@@ -126,20 +226,48 @@ impl Daemon {
             }
         }
 
-        let network_info = rpc.get_network_info()?;
-        if network_info.version < 21_00_00 {
-            bail!("electrs requires bitcoind 0.21+");
-        }
-        if !network_info.network_active {
-            bail!("electrs requires active bitcoind p2p network");
-        }
-        let info = rpc.get_blockchain_info()?;
-        if info.pruned {
-            bail!("electrs requires non-pruned bitcoind node");
+        // --------------------------------------------------------------------
+        // Network info / version / active-network checks
+        // --------------------------------------------------------------------
+        if is_pivx {
+            // PIVX: use raw JSON, minimal schema, avoid Bitcoin-only fields like `localrelay`
+            let raw = rpc.call("getnetworkinfo", &[])?;
+
+            #[derive(Deserialize)]
+            struct PivxNetworkInfo {
+                #[serde(rename = "networkactive")]
+                network_active: bool,
+            }
+
+            let info: PivxNetworkInfo = serde_json::from_value(raw)
+                .context("failed to parse PIVX getnetworkinfo")?;
+
+            if !info.network_active {
+                bail!("electrs requires active PIVX p2p network");
+            }
+
+            // No version / pruned checks here — PIVX has its own semantics.
+
+        } else {
+            // Original Bitcoin behavior
+            let network_info = rpc.get_network_info()?;
+            if network_info.version < 21_00_00 {
+                bail!("electrs requires bitcoind 0.21+");
+            }
+            if !network_info.network_active {
+                bail!("electrs requires active bitcoind p2p network");
+            }
+
+            // Bitcoin-only pruned check via typed RPC; PIVX path skips this
+            let info = rpc.get_blockchain_info()?;
+            if info.pruned {
+                bail!("electrs requires non-pruned bitcoind node");
+            }
         }
 
         let p2p = Mutex::new(Connection::connect(
-            config.btc_network,
+            &config.network,      // "bitcoin", "testnet", "pivx", etc.
+            config.btc_network,   // still used for internal network enums
             config.daemon_p2p_addr,
             metrics,
             config.signet_magic,

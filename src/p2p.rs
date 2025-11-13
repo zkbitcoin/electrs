@@ -21,7 +21,7 @@ use bitcoin_slices::{bsl, Parse};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
 
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::types::SerBlock;
@@ -59,14 +59,13 @@ pub(crate) struct Connection {
     blocks_recv: Receiver<SerBlock>,
     headers_recv: Receiver<Vec<BlockHeader>>,
     new_block_recv: Receiver<()>,
-
     blocks_duration: Histogram,
 }
 
 impl Connection {
     /// Get new block headers (supporting reorgs).
     /// https://en.bitcoin.it/wiki/Protocol_documentation#getheaders
-    /// Defined as `&mut self` to prevent concurrent invocations (https://github.com/romanz/electrs/pull/526#issuecomment-934685515).
+    /// Defined as `&mut self` to prevent concurrent invocations.
     pub(crate) fn get_new_headers(&mut self, chain: &Chain) -> Result<Vec<NewHeader>> {
         self.req_send.send(Request::get_new_headers(chain))?;
         let headers = self
@@ -91,8 +90,7 @@ impl Connection {
     }
 
     /// Request and process the specified blocks (in the specified order).
-    /// See https://en.bitcoin.it/wiki/Protocol_documentation#getblocks for details.
-    /// Defined as `&mut self` to prevent concurrent invocations (https://github.com/romanz/electrs/pull/526#issuecomment-934685515).
+    /// Defined as `&mut self` to prevent concurrent invocations.
     pub(crate) fn for_blocks<B, F>(&mut self, blockhashes: B, mut func: F) -> Result<()>
     where
         B: IntoIterator<Item = BlockHash>,
@@ -130,19 +128,28 @@ impl Connection {
         })
     }
 
-    /// Note: only a single receiver will get the notification (https://github.com/romanz/electrs/pull/526#issuecomment-934687415).
+    /// Note: only a single receiver will get the notification.
     pub(crate) fn new_block_notification(&self) -> Receiver<()> {
         self.new_block_recv.clone()
     }
 
+    /// Connect to daemon via P2P.
+    ///
+    /// `chain_name` is the raw config string ("bitcoin", "testnet", "pivx", etc).
+    /// `btc_network` is the bitcoin::Network used internally by electrs.
     pub(crate) fn connect(
-        network: Network,
+        chain_name: &str,
+        btc_network: Network,
         address: SocketAddr,
         metrics: &Metrics,
         magic: Magic,
     ) -> Result<Self> {
-        let recv_conn = TcpStream::connect(address)
-            .with_context(|| format!("{} p2p failed to connect: {:?}", network, address))?;
+        let _ = btc_network; // silence warning for now
+        let is_pivx = chain_name == "pivx";
+
+        let recv_conn = TcpStream::connect(address).with_context(|| {
+            format!("{} p2p failed to connect: {:?}", chain_name, address)
+        })?;
         let mut send_conn = recv_conn
             .try_clone()
             .context("failed to clone connection")?;
@@ -248,7 +255,10 @@ impl Connection {
         let (new_block_send, new_block_recv) = bounded::<()>(0);
         let (init_send, init_recv) = bounded::<()>(0);
 
-        tx_send.send(build_version_message())?;
+        // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        // PIVX-aware version message
+        // >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        tx_send.send(build_version_message(is_pivx, address))?;
 
         crate::thread::spawn("p2p_loop", move || loop {
             select! {
@@ -278,7 +288,6 @@ impl Connection {
                             if inventory.iter().any(|inv| matches!(inv, Inventory::Block(_))) {
                                 let _ = new_block_send.try_send(()); // best-effort notification
                             }
-
                         },
                         ParsedNetworkMessage::Ping(nonce) => {
                             tx_send.send(NetworkMessage::Pong(nonce))?; // connection keep-alive
@@ -308,7 +317,8 @@ impl Connection {
             }
         });
 
-        init_recv.recv()?; // wait until `verack` is received
+        // Wait until `verack` is received
+        init_recv.recv()?;
 
         Ok(Connection {
             req_send,
@@ -320,27 +330,47 @@ impl Connection {
     }
 }
 
-fn build_version_message() -> NetworkMessage {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 0);
+// Correct PIVX protocol version (from chainparams)
+const PIVX_PROTOCOL_VERSION: u32 = 70927;   // current PROTOCOL_VERSION
+
+fn build_version_message(is_pivx: bool, daemon_addr: SocketAddr) -> NetworkMessage {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("Time error")
         .as_secs() as i64;
 
-    let services = p2p::ServiceFlags::NONE;
+    let (version, services, relay, user_agent) = if is_pivx {
+        (
+            PIVX_PROTOCOL_VERSION,
+            p2p::ServiceFlags::NETWORK,
+            true,
+            format!("/electrs-pivx:{}/", ELECTRS_VERSION),
+        )
+    } else {
+        (
+            p2p::PROTOCOL_VERSION,
+            p2p::ServiceFlags::NETWORK,
+            true,
+            format!("/electrs:{}/", ELECTRS_VERSION),
+        )
+    };
+
+    // Use the actual daemon P2P address (NOT 0.0.0.0:0)
+    let addr = address::Address::new(&daemon_addr, services);
 
     NetworkMessage::Version(message_network::VersionMessage {
-        version: p2p::PROTOCOL_VERSION,
+        version,
         services,
         timestamp,
-        receiver: address::Address::new(&addr, services),
-        sender: address::Address::new(&addr, services),
+        receiver: addr.clone(),
+        sender:   addr,
         nonce: secp256k1::rand::thread_rng().gen(),
-        user_agent: format!("/electrs:{}/", ELECTRS_VERSION),
-        start_height: 0,
-        relay: false,
+        user_agent,
+        start_height: 0, // set later if you want, safe as 0
+        relay,
     })
 }
+
 
 struct RawNetworkMessage {
     magic: Magic,
@@ -351,11 +381,13 @@ struct RawNetworkMessage {
 impl RawNetworkMessage {
     fn parse(self) -> Result<ParsedNetworkMessage> {
         let mut raw: &[u8] = &self.raw;
-        let payload = match self.cmd.as_ref() {
+
+        let msg = match self.cmd.as_ref() {
+            // --- Messages we actually care about ---------------------------------
             "version" => ParsedNetworkMessage::Version(Decodable::consensus_decode(&mut raw)?),
-            "verack" => ParsedNetworkMessage::Verack,
-            "inv" => ParsedNetworkMessage::Inv(Decodable::consensus_decode(&mut raw)?),
-            "block" => ParsedNetworkMessage::Block(self.raw),
+            "verack"  => ParsedNetworkMessage::Verack,
+            "inv"     => ParsedNetworkMessage::Inv(Decodable::consensus_decode(&mut raw)?),
+            "block"   => ParsedNetworkMessage::Block(self.raw),
             "headers" => {
                 let len = VarInt::consensus_decode(&mut raw)?.0;
                 let mut headers = Vec::with_capacity(len as usize);
@@ -365,18 +397,46 @@ impl RawNetworkMessage {
                 ParsedNetworkMessage::Headers(headers)
             }
             "ping" => ParsedNetworkMessage::Ping(Decodable::consensus_decode(&mut raw)?),
-            "pong" => ParsedNetworkMessage::Ignored, // unused
-            "addr" => ParsedNetworkMessage::Ignored, // unused
-            "alert" => ParsedNetworkMessage::Ignored, // https://bitcoin.org/en/alert/2016-11-01-alert-retirement
-            _ => bail!(
-                "unsupported message: command={}, payload={:?}",
-                self.cmd,
-                self.raw
-            ),
+
+            // --- Messages we explicitly ignore but are normal in modern nodes ----
+            // Keep-alives / bookkeeping / optional features:
+            "pong"        => ParsedNetworkMessage::Ignored,
+            "addr"        => ParsedNetworkMessage::Ignored,
+            "addrv2"      => ParsedNetworkMessage::Ignored,
+            "getaddr"     => ParsedNetworkMessage::Ignored,
+            "sendaddrv2"  => ParsedNetworkMessage::Ignored, // BIP155 (PIVX 5.6.1 does this)
+            "mempool"     => ParsedNetworkMessage::Ignored,
+
+            // Fee / relay policy:
+            "feefilter"   => ParsedNetworkMessage::Ignored,
+
+            // Compact blocks (BIP152):
+            "sendcmpct"   => ParsedNetworkMessage::Ignored,
+            "cmpctblock"  => ParsedNetworkMessage::Ignored,
+            "getblocktxn" => ParsedNetworkMessage::Ignored,
+            "blocktxn"    => ParsedNetworkMessage::Ignored,
+
+            // Headers / negotiation:
+            "sendheaders" => ParsedNetworkMessage::Ignored,
+
+            // Bloom filters / SPV:
+            "filterload"  => ParsedNetworkMessage::Ignored,
+            "filteradd"   => ParsedNetworkMessage::Ignored,
+            "filterclear" => ParsedNetworkMessage::Ignored,
+            "merkleblock" => ParsedNetworkMessage::Ignored,
+
+            // Misc / rarely used / deprecated:
+            "notfound"    => ParsedNetworkMessage::Ignored,
+            "alert"       => ParsedNetworkMessage::Ignored,
+
+            // Future / unknown messages: ignore instead of crashing
+            _ => ParsedNetworkMessage::Ignored,
         };
-        Ok(payload)
+
+        Ok(msg)
     }
 }
+
 
 #[derive(Debug)]
 enum ParsedNetworkMessage {

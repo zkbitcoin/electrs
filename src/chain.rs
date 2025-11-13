@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use bitcoin::blockdata::block::Header as BlockHeader;
 use bitcoin::{BlockHash, Network};
+use hex_literal::hex;
 
 /// A new header found, to be added to the chain at specific height
 pub(crate) struct NewHeader {
@@ -36,14 +37,37 @@ pub struct Chain {
 
 impl Chain {
     // create an empty chain
-    pub fn new(network: Network) -> Self {
-        let genesis = bitcoin::blockdata::constants::genesis_block(network);
-        let genesis_hash = genesis.block_hash();
+    pub fn new(btc_network: Network, chain_name: String) -> Self {
+        // -------------------------------------------------------------
+        // PIVX MODE
+        // -------------------------------------------------------------
+        if chain_name == "pivx" {
+            // EXACT 80-byte PIVX genesis header (160 hex chars)
+            const PIVX_GENESIS: [u8; 80] = hex_literal::hex!(
+                "0100000000000000000000000000000000000000000000000000000000000000000000003e9a2c3325f1ed52ffb4058a7b5c4a14f63b9e55a9d04c2f8d5026a7562ed2915aa58256f00f1e0f3b9c2400"
+            );
+            let header: BlockHeader = bitcoin::consensus::deserialize(&PIVX_GENESIS)
+                .expect("valid PIVX genesis");
+            let hash = header.block_hash();
+
+            return Self {
+                headers: vec![(hash, header)],
+                heights: std::iter::once((hash, 0)).collect(),
+            };
+        }
+
+        // -------------------------------------------------------------
+        // BITCOIN / TESTNET / REGTEST → unchanged
+        // -------------------------------------------------------------
+        let genesis = bitcoin::blockdata::constants::genesis_block(btc_network);
+        let hash = genesis.block_hash();
+
         Self {
-            headers: vec![(genesis_hash, genesis.header)],
-            heights: std::iter::once((genesis_hash, 0)).collect(), // genesis header @ zero height
+            headers: vec![(hash, genesis.header)],
+            heights: std::iter::once((hash, 0)).collect(),
         }
     }
+
 
     pub(crate) fn drop_last_headers(&mut self, n: usize) {
         if n == 0 {
